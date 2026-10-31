@@ -1,0 +1,29 @@
+# VM 名と固定 IP の定義 (唯一の情報源)
+# VM の作成 (localhost) と VM 内のプロビジョニング (SSH) の両方がここを参照する
+all:
+  vars:
+    ansible_user: ubuntu
+  children:
+    # ゴールデンイメージ作成用の一時 VM (イメージ作成後に削除される)
+    builder:
+      hosts:
+        isu-builder:
+          ansible_host: 192.168.2.135
+    # 競技サーバ (c5.large 相当 x 3)
+    contest:
+      hosts:
+        isu1:
+          ansible_host: 192.168.2.131
+        isu2:
+          ansible_host: 192.168.2.132
+        isu3:
+          ansible_host: 192.168.2.133
+    # ベンチマーカー
+    bench:
+      hosts:
+        isu-bench:
+          ansible_host: 192.168.2.134
+    isucon:
+      children:
+        contest:
+        bench:

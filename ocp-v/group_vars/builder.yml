@@ -1,0 +1,9 @@
+---
+# ビルド (Perl/Ruby/PHP のソースビルド等) を速く終わらせるため一時的に大きめにする
+vm_spec:
+  sockets: 1
+  cores: 4
+  threads: 1
+  memory: 8Gi
+  cpu_request: "2"
+  cpu_limit: "4"

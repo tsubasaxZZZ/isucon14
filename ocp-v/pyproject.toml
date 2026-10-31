@@ -1,0 +1,13 @@
+[project]
+name = "isucon14-ocp-v"
+version = "0.1.0"
+description = "ISUCON14 環境を OpenShift Virtualization 上の VM として構築する Ansible"
+requires-python = ">=3.12"
+dependencies = [
+  # ansible (community package) には kubernetes.core / community.general / ansible.posix が同梱されている
+  "ansible>=11",
+  "kubernetes>=31",
+]
+
+[tool.uv]
+package = false

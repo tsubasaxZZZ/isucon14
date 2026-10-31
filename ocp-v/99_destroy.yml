@@ -1,0 +1,44 @@
+---
+# 片付け
+#   VM のみ削除            : ansible-playbook 99_destroy.yml
+#   イメージも削除          : ansible-playbook 99_destroy.yml -e destroy_images=true
+#   Namespace ごと削除      : ansible-playbook 99_destroy.yml -e destroy_namespace=true
+- name: Destroy ISUCON14 environment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    destroy_images: false
+    destroy_namespace: false
+  tasks:
+    - name: Delete VMs (root DataVolume も一緒に削除される)
+      kubernetes.core.k8s:
+        state: absent
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ vm_namespace }}"
+        name: "{{ item }}"
+        wait: true
+      loop: "{{ groups['isucon'] + groups['builder'] }}"
+
+    - name: Delete image DataVolumes
+      kubernetes.core.k8s:
+        state: absent
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        namespace: "{{ vm_namespace }}"
+        name: "{{ item }}"
+        wait: true
+      loop:
+        - "{{ golden_dv_name }}"
+        - "{{ base_dv_name }}"
+      when: destroy_images | bool or destroy_namespace | bool
+
+    - name: Delete namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ vm_namespace }}"
+        wait: true
+      when: destroy_namespace | bool

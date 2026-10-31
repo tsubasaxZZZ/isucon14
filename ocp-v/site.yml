@@ -1,0 +1,7 @@
+---
+- name: Base image
+  ansible.builtin.import_playbook: 00_base_image.yml
+- name: Golden image
+  ansible.builtin.import_playbook: 10_golden.yml
+- name: Deploy VMs
+  ansible.builtin.import_playbook: 20_deploy.yml

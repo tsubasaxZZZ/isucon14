@@ -1,0 +1,54 @@
+---
+# Namespace を作成し、Ubuntu 24.04 のクラウドイメージを DataVolume として取り込む
+- name: Prepare namespace and base image
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ vm_namespace }}"
+            labels: "{{ namespace_labels }}"
+
+    - name: Wait for lab-localnet NetworkAttachmentDefinition (created by ClusterUserDefinedNetwork)
+      kubernetes.core.k8s_info:
+        api_version: k8s.cni.cncf.io/v1
+        kind: NetworkAttachmentDefinition
+        namespace: "{{ vm_namespace }}"
+        name: "{{ lan_network }}"
+      register: nad
+      until: nad.resources | length > 0
+      retries: 30
+      delay: 5
+
+    - name: Import Ubuntu 24.04 cloud image
+      kubernetes.core.k8s:
+        state: present
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 1800
+        definition:
+          apiVersion: cdi.kubevirt.io/v1beta1
+          kind: DataVolume
+          metadata:
+            name: "{{ base_dv_name }}"
+            namespace: "{{ vm_namespace }}"
+            annotations:
+              # WaitForFirstConsumer の StorageClass でも即時に取り込む
+              cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+          spec:
+            source:
+              http:
+                url: "{{ ubuntu_image_url }}"
+            storage:
+              storageClassName: "{{ storage_class }}"
+              resources:
+                requests:
+                  storage: "{{ disk_size }}"

@@ -1,0 +1,325 @@
+---
+# ゴールデンイメージの作成 (AMI 作成に相当)
+#   1. 一時 VM (isu-builder) を起動
+#   2. VM 内で frontend / bench をビルドし、成果物を上流ロールの files/ に回収
+#   3. 上流ロールで競技環境 + ベンチマーカーをセットアップ
+#   4. 自己署名証明書の差し替え・cloud-init のクリーンアップ
+#   5. VM を停止し、ルートディスクを golden DataVolume としてクローン → 一時 VM を削除
+
+- name: Create builder VM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create builder VM from base image
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('ansible.builtin.template', 'templates/vm.yaml.j2') | from_yaml }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 1200
+      vars:
+        vm_name: "{{ item }}"
+        vm_role: builder
+        vm_ip: "{{ hostvars[item].ansible_host }}"
+        vm_spec: "{{ hostvars[item].vm_spec }}"
+        vm_source_pvc: "{{ base_dv_name }}"
+      loop: "{{ groups['builder'] }}"
+
+- name: Build artifacts on builder
+  hosts: builder
+  gather_facts: false
+  become: true
+  vars:
+    src_dir: /tmp/isucon14
+    build_path: /snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+
+    - name: Wait for cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      register: ci
+      changed_when: false
+      failed_when: ci.rc not in [0, 2]  # 2 = degraded (警告のみ)
+
+    - name: Install build tools
+      ansible.builtin.apt:
+        name: [curl, make, openssl, git, rsync]
+        update_cache: true
+
+    - name: Install go / node (snap)
+      ansible.builtin.command: "snap install {{ item }} --classic"
+      args:
+        creates: "/snap/bin/{{ item }}"
+      loop: [go, node]
+
+    # pnpm 10 は ERR_PNPM_IGNORED_BUILDS で frontend の install が失敗するため 9 に固定
+    - name: Install pnpm 9
+      ansible.builtin.command: npm install -g pnpm@9
+      environment:
+        PATH: "{{ build_path }}"
+      changed_when: true
+
+    - name: Create local source archive (git HEAD)
+      ansible.builtin.command: >-
+        git -C {{ playbook_dir }}/.. archive --format=tar.gz
+        -o {{ playbook_dir }}/.artifacts/isucon14-src.tar.gz HEAD
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: true
+
+    - name: Recreate source dir
+      ansible.builtin.file:
+        path: "{{ src_dir }}"
+        state: "{{ item }}"
+        mode: "0755"
+      loop: [absent, directory]
+
+    - name: Upload source
+      ansible.builtin.unarchive:
+        src: "{{ playbook_dir }}/.artifacts/isucon14-src.tar.gz"
+        dest: "{{ src_dir }}"
+
+    - name: Build frontend
+      ansible.builtin.command: make
+      args:
+        chdir: "{{ src_dir }}/frontend"
+      environment:
+        PATH: "{{ build_path }}"
+      changed_when: true
+
+    - name: Copy frontend build into webapp/public
+      ansible.builtin.command: cp -r {{ src_dir }}/frontend/build/client {{ src_dir }}/webapp/public
+      changed_when: true
+
+    - name: Build benchmarker
+      ansible.builtin.command: go build -buildvcs=false -ldflags "-s -w" -o {{ src_dir }}/bench_linux_amd64
+      args:
+        chdir: "{{ src_dir }}/bench"
+      environment:
+        PATH: "{{ build_path }}"
+      changed_when: true
+
+    - name: Archive webapp
+      ansible.builtin.command: tar zcf {{ src_dir }}/webapp.tar.gz webapp
+      args:
+        chdir: "{{ src_dir }}"
+      changed_when: true
+
+    - name: Fetch artifacts into upstream role files/
+      ansible.builtin.fetch:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        flat: true
+      loop:
+        - src: "{{ src_dir }}/webapp.tar.gz"
+          dest: "{{ upstream_roles_dir }}/webapp/files/webapp.tar.gz"
+        - src: "{{ src_dir }}/bench_linux_amd64"
+          dest: "{{ upstream_roles_dir }}/bench/files/bench_linux_amd64"
+
+    - name: Remove build toolchain (AMI 版と同様に go / node は残さない)
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - npm uninstall -g pnpm
+        - snap remove node
+        - snap remove go
+      environment:
+        PATH: "{{ build_path }}"
+      changed_when: true
+
+    - name: Remove source dir
+      ansible.builtin.file:
+        path: "{{ src_dir }}"
+        state: absent
+
+# 上流の application-base.yml + application.yml + benchmark.yml 相当
+# - aws-isucon と同様に isuadmin-user / envcheck は除外
+# - 参考実装は Go のみ: xbuildwebapp (Rust/Node/Perl/Ruby/PHP/Python の処理系ビルド) を除外し、
+#   webapp ロールは main.yaml を使わず共通部分 + matcher / payment_mock / go だけを実行する
+#   (Go 処理系は xbuild ロールで入る)
+- name: Provision ISUCON14 (Go 実装 + benchmarker)
+  hosts: builder
+  gather_facts: true
+  become: true
+  roles:
+    - base
+    - apt
+    - isucon-user
+    - xbuild
+    - mysql
+    - nginx
+    - bench
+  tasks:
+    - name: Send webapp tarball
+      ansible.builtin.copy:
+        src: "{{ upstream_roles_dir }}/webapp/files/webapp.tar.gz"
+        dest: /home/isucon/webapp.tar.gz
+        mode: "0644"
+
+    - name: Remove old webapp
+      ansible.builtin.file:
+        path: /home/isucon/webapp
+        state: absent
+
+    - name: Extract webapp.tar.gz into /home/isucon
+      become_user: isucon
+      ansible.builtin.unarchive:
+        remote_src: true
+        src: /home/isucon/webapp.tar.gz
+        dest: /home/isucon/
+
+    - name: Remove webapp.tar.gz
+      ansible.builtin.file:
+        path: /home/isucon/webapp.tar.gz
+        state: absent
+
+    - name: Initialize database
+      ansible.builtin.shell: |
+        set -e
+        mysql -uroot -e "DROP DATABASE IF EXISTS isuride; CREATE DATABASE IF NOT EXISTS isuride;"
+        sh /home/isucon/webapp/sql/init.sh
+      changed_when: true
+
+    - name: Deploy matcher / payment_mock / isuride-go (上流 webapp ロールのタスクを流用)
+      ansible.builtin.include_role:
+        name: webapp
+        tasks_from: "{{ item }}"
+      loop:
+        - matcher
+        - payment_mock
+        - go
+
+- name: Finalize golden image
+  hosts: builder
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Symlink /home/isucon/bench (aws-isucon と同じコマンドで実行できるように)
+      ansible.builtin.file:
+        src: /home/isucon/bench_linux_amd64
+        dest: /home/isucon/bench
+        state: link
+        owner: isucon
+        group: isucon
+
+    # 同梱の証明書は 2025-02-01 で期限切れのため自己署名証明書に差し替える
+    - name: Generate self-signed certificate for *.xiv.isucon.net
+      ansible.builtin.shell: |
+        set -e
+        cd /etc/nginx/tls
+        printf 'basicConstraints=critical,CA:true,pathlen:0\nsubjectAltName=DNS.1:*.xiv.isucon.net,DNS.2:xiv.isucon.net\n' > /tmp/extfile.txt
+        openssl req -subj '/CN=*.xiv.isucon.net' -nodes -newkey rsa:2048 \
+          -keyout _.xiv.isucon.net.key -out /tmp/xiv.csr
+        openssl x509 -req -in /tmp/xiv.csr -signkey _.xiv.isucon.net.key -sha256 -days 3650 \
+          -out _.xiv.isucon.net.crt -extfile /tmp/extfile.txt
+        rm -f /tmp/extfile.txt /tmp/xiv.csr
+      changed_when: true
+
+    # isuride-matcher が curl で https://isuride.xiv.isucon.net にアクセスするため CA として信頼させる
+    - name: Trust self-signed certificate
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p /usr/share/ca-certificates/isucon
+        cp /etc/nginx/tls/_.xiv.isucon.net.crt /usr/share/ca-certificates/isucon/
+        grep -qx 'isucon/_.xiv.isucon.net.crt' /etc/ca-certificates.conf \
+          || echo 'isucon/_.xiv.isucon.net.crt' >> /etc/ca-certificates.conf
+        update-ca-certificates
+      changed_when: true
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+    - name: Clean apt cache
+      ansible.builtin.command: apt-get clean
+      changed_when: true
+
+    # クローン先で cloud-init が新しいインスタンスとして再実行されるようにする
+    # (ホスト名・固定 IP・SSH ホスト鍵・machine-id が VM ごとに再生成される)
+    - name: Clean cloud-init state
+      ansible.builtin.command: cloud-init clean --logs --seed --machine-id --configs all
+      changed_when: true
+
+    - name: Sync disks
+      ansible.builtin.command: sync
+      changed_when: false
+
+- name: Snapshot builder disk as golden image
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    builder: "{{ groups['builder'][0] }}"
+  tasks:
+    - name: Stop builder VM
+      kubernetes.core.k8s:
+        state: patched
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ vm_namespace }}"
+        name: "{{ builder }}"
+        definition:
+          spec:
+            runStrategy: Halted
+
+    - name: Wait for builder VMI to disappear
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        namespace: "{{ vm_namespace }}"
+        name: "{{ builder }}"
+      register: vmi
+      until: vmi.resources | length == 0
+      retries: 60
+      delay: 5
+
+    - name: Recreate golden DataVolume
+      kubernetes.core.k8s:
+        state: absent
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        namespace: "{{ vm_namespace }}"
+        name: "{{ golden_dv_name }}"
+        wait: true
+
+    - name: Clone builder disk into golden DataVolume
+      kubernetes.core.k8s:
+        state: present
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 1800
+        definition:
+          apiVersion: cdi.kubevirt.io/v1beta1
+          kind: DataVolume
+          metadata:
+            name: "{{ golden_dv_name }}"
+            namespace: "{{ vm_namespace }}"
+            annotations:
+              cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+          spec:
+            source:
+              pvc:
+                namespace: "{{ vm_namespace }}"
+                name: "{{ builder }}-root"
+            storage:
+              storageClassName: "{{ storage_class }}"
+              resources:
+                requests:
+                  storage: "{{ disk_size }}"
+
+    - name: Delete builder VM (root DataVolume も一緒に削除される)
+      kubernetes.core.k8s:
+        state: absent
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ vm_namespace }}"
+        name: "{{ builder }}"
+        wait: true

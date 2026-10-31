@@ -1,0 +1,87 @@
+{#- 入力: vm_name, vm_role, vm_ip, vm_source_pvc, vm_spec -#}
+{%- set user_data = {
+  'hostname': vm_name,
+  'ssh_pwauth': false,
+  'ssh_authorized_keys': ssh_public_keys,
+} -%}
+{%- set network_data = {
+  'version': 2,
+  'ethernets': {
+    'lan0': {
+      'match': {'name': 'en*'},
+      'dhcp4': false,
+      'dhcp6': false,
+      'addresses': [vm_ip ~ '/' ~ lan_prefix],
+      'routes': [{'to': 'default', 'via': lan_gateway}],
+      'nameservers': {'addresses': lan_dns},
+    },
+  },
+} -%}
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: {{ vm_name }}
+  namespace: {{ vm_namespace }}
+  labels:
+    app.kubernetes.io/part-of: isucon14
+    isucon14/role: {{ vm_role }}
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    - metadata:
+        name: {{ vm_name }}-root
+      spec:
+        source:
+          pvc:
+            namespace: {{ vm_namespace }}
+            name: {{ vm_source_pvc }}
+        storage:
+          storageClassName: {{ storage_class }}
+          resources:
+            requests:
+              storage: {{ disk_size }}
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: {{ vm_name }}
+        app.kubernetes.io/part-of: isucon14
+    spec:
+      nodeSelector: {{ node_selector | to_json }}
+      terminationGracePeriodSeconds: 180
+      domain:
+        cpu:
+          sockets: {{ vm_spec.sockets }}
+          cores: {{ vm_spec.cores }}
+          threads: {{ vm_spec.threads }}
+        memory:
+          guest: {{ vm_spec.memory }}
+        resources:
+          requests:
+            cpu: {{ vm_spec.cpu_request | string | to_json }}
+          limits:
+            cpu: {{ vm_spec.cpu_limit | string | to_json }}
+        devices:
+          disks:
+            - name: root
+              disk:
+                bus: virtio
+            - name: cloudinit
+              disk:
+                bus: virtio
+          interfaces:
+            # EC2 と同様に NIC 1 枚 (lab-lan に L2 直結)
+            - name: lan
+              bridge: {}
+          rng: {}
+      networks:
+        - name: lan
+          multus:
+            networkName: {{ lan_network }}
+      volumes:
+        - name: root
+          dataVolume:
+            name: {{ vm_name }}-root
+        - name: cloudinit
+          cloudInitNoCloud:
+            userData: {{ ("#cloud-config\n" ~ (user_data | to_nice_yaml)) | to_json }}
+            networkData: {{ (network_data | to_nice_yaml) | to_json }}

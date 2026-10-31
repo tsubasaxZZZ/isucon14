@@ -1,0 +1,46 @@
+---
+# ---- OpenShift ----
+# kubeconfig の current-context のクラスタに対して作成する
+vm_namespace: isucon14
+namespace_labels:
+  # lab-localnet (ClusterUserDefinedNetwork) の namespaceSelector に合わせる
+  homelab.io/purpose: lab-vm
+
+# LVMS は worker-virt にしか無いので VM はすべて worker-virt に置く
+storage_class: lvms-worker
+node_selector:
+  kubernetes.io/hostname: worker-virt
+
+# ---- ネットワーク (lab-lan 直結の localnet、IPAM なし → cloud-init で固定 IP) ----
+lan_network: lab-localnet
+lan_prefix: 24
+lan_gateway: 192.168.2.2
+lan_dns:
+  - 192.168.2.238
+
+# ubuntu ユーザの authorized_keys に登録する公開鍵
+# (先頭は Ansible の接続に使うので消さないこと)
+ssh_public_keys:
+  - "{{ lookup('ansible.builtin.file', '~/.ssh/id_ed25519.pub') }}"
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/mp9dm39yWybk9Ba9HiCscMEffyRNrYp1hsjGdJi+M key
+
+# ---- イメージ ----
+ubuntu_image_url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+base_dv_name: ubuntu-noble-base
+golden_dv_name: isucon14-golden
+
+# ---- VM スペック ----
+# ISUCON14 本番: c5.large (2 vCPU = 1 core x 2 threads, 4 GiB), gp3 20GB
+disk_size: 20Gi
+vm_spec:
+  sockets: 1
+  cores: 1
+  threads: 2
+  memory: 4Gi
+  # worker-virt に 2 コア x 台数を予約する空きが無いため overcommit する
+  # (ゲストからは 2 vCPU に見え、上限 2 コアまで使える)
+  cpu_request: 500m
+  cpu_limit: "2"
+
+# 上流ロールの files/ (ビルド成果物の置き場所。.gitignore 済み)
+upstream_roles_dir: "{{ playbook_dir }}/../provisioning/ansible/roles"

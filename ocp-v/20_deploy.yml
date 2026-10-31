@@ -1,0 +1,102 @@
+---
+# ゴールデンイメージから競技サーバ 3 台 + ベンチマーカー 1 台を作成する
+
+- name: Create ISUCON VMs from golden image
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check golden DataVolume
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        namespace: "{{ vm_namespace }}"
+        name: "{{ golden_dv_name }}"
+      register: golden
+      failed_when: golden.resources | length == 0
+
+    # 全台を先に作成してからまとめて待つ (ディスクのクローンを並列に進める)
+    - name: Create VMs
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('ansible.builtin.template', 'templates/vm.yaml.j2') | from_yaml }}"
+      vars:
+        vm_name: "{{ item }}"
+        vm_role: "{{ 'bench' if item in groups['bench'] else 'contest' }}"
+        vm_ip: "{{ hostvars[item].ansible_host }}"
+        vm_spec: "{{ hostvars[item].vm_spec }}"
+        vm_source_pvc: "{{ golden_dv_name }}"
+      loop: "{{ groups['isucon'] }}"
+
+    - name: Wait for VMs to be Ready
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ vm_namespace }}"
+        name: "{{ item }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 2400
+      loop: "{{ groups['isucon'] }}"
+
+- name: Wait for VMs
+  hosts: isucon
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+
+    - name: Wait for cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      register: ci
+      changed_when: false
+      failed_when: ci.rc not in [0, 2]
+
+    # cloud-init が鍵を入れるのは ubuntu ユーザだけなので、isucon ユーザにも登録する
+    # (ゴールデンイメージでは上流の isucon-user ロールが authorized_keys を削除している)
+    - name: Authorize SSH keys for isucon user
+      ansible.posix.authorized_key:
+        user: isucon
+        key: "{{ ssh_public_keys | join('\n') }}"
+
+# ベンチマーカーでは競技アプリを動かさない (CPU/メモリをベンチに回す)
+- name: Disable application services on benchmarker
+  hosts: bench
+  gather_facts: false
+  become: true
+  tasks:
+    - name: List isuride services
+      ansible.builtin.shell: systemctl list-unit-files 'isuride-*.service' --no-legend | awk '{print $1}'
+      register: isuride_units
+      changed_when: false
+
+    - name: Stop and disable application services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: "{{ isuride_units.stdout_lines + ['nginx.service', 'mysql.service'] }}"
+
+- name: Summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    bench_ip: "{{ hostvars[groups['bench'][0]].ansible_host }}"
+    target_ip: "{{ hostvars[groups['contest'][0]].ansible_host }}"
+  tasks:
+    - name: Show how to use
+      ansible.builtin.debug:
+        msg:
+          - "競技サーバ: {% for h in groups['contest'] %}{{ h }}={{ hostvars[h].ansible_host }} {% endfor %}"
+          - "ベンチ    : {{ groups['bench'][0] }}={{ bench_ip }}"
+          - "ログイン  : ssh ubuntu@{{ target_ip }}"
+          - "ブラウザ  : hosts に '{{ target_ip }} isuride.xiv.isucon.net' を追記して https://isuride.xiv.isucon.net/"
+          - >-
+            ベンチ実行: ssh ubuntu@{{ bench_ip }} → sudo -i -u isucon →
+            ./bench run --addr {{ target_ip }}:443 --target https://isuride.xiv.isucon.net
+            --payment-url http://{{ bench_ip }}:12346 --payment-bind-port 12346
