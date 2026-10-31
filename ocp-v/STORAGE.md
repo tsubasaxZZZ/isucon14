@@ -94,7 +94,7 @@ flowchart LR
     CDI2["CDI"] -- "CSI の CreateVolume<br/>(source = 元 PVC)" --> DRV2["TopoLVM"]
     DRV2 -- "lvcreate --snapshot<br/>(thin スナップショット)" --> LVM2["thin pool"]
     LVM2 -. "同じブロックを共有<br/>(書いた所だけ別保存)" .- A[("元 PVC")]
-    LVM2 -. "" .- B[("新 PVC")]
+    LVM2 -.- B[("新 PVC")]
 ```
 
 - CDI は「複製して」と CSI ドライバに頼むだけで、データは運ばない
